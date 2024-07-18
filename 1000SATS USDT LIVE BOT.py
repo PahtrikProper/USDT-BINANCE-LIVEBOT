@@ -9,7 +9,7 @@ load_dotenv()
 
 # Configurable Parameters
 SYMBOL = '1000SATS/USDT'
-ORDER_BOOK_DEPTH = 90
+ORDER_BOOK_DEPTH = 190
 TRADE_AMOUNT = 200
 TRADE_INTERVAL_SECONDS = 2
 MIN_PROFIT_PERCENTAGE = 0.0028  # Minimum profit percentage
@@ -46,7 +46,7 @@ def load_markets_data():
         logger.error(f"Exchange error: {e}")
     except ccxt.RateLimitExceeded as e:
         logger.error(f"Rate limit exceeded: {e}")
-        time.sleep(60)
+        time.sleep(20)
     return None
 
 market_data = load_markets_data()
@@ -60,7 +60,7 @@ def fetch_order_book(symbol, limit=ORDER_BOOK_DEPTH):
         logger.error(f"Exchange error: {e}")
     except ccxt.RateLimitExceeded as e:
         logger.error(f"Rate limit exceeded: {e}")
-        time.sleep(60)
+        time.sleep(20)
     return None
 
 def fetch_recent_trades(symbol, limit=100):
@@ -72,7 +72,7 @@ def fetch_recent_trades(symbol, limit=100):
         logger.error(f"Exchange error: {e}")
     except ccxt.RateLimitExceeded as e:
         logger.error(f"Rate limit exceeded: {e}")
-        time.sleep(60)
+        time.sleep(20)
     return None
 
 def analyze_order_book(order_book):
@@ -109,6 +109,11 @@ def analyze_order_book(order_book):
             potential_sell_price = ask_price
             break
 
+    # Enhance logic by considering the overall buy and sell pressure
+    buy_pressure = sum(bid[1] for bid in bids[:ORDER_BOOK_DEPTH//2])
+    sell_pressure = sum(ask[1] for ask in asks[:ORDER_BOOK_DEPTH//2])
+    overall_pressure = buy_pressure - sell_pressure
+
     return {
         'best_ask_price': best_ask_price,
         'best_bid_price': best_bid_price,
@@ -116,7 +121,8 @@ def analyze_order_book(order_book):
         'market_condition': market_condition,
         'significant_sell_walls': significant_sell_walls,
         'significant_support_levels': significant_support_levels,
-        'potential_sell_price': potential_sell_price
+        'potential_sell_price': potential_sell_price,
+        'overall_pressure': overall_pressure
     }
 
 def analyze_recent_trades(recent_trades):
@@ -199,7 +205,7 @@ def place_order(symbol, side, price, amount):
         logger.error(f"Exchange error: {e}")
     except ccxt.RateLimitExceeded as e:
         logger.error(f"Rate limit exceeded: {e}")
-        time.sleep(60)
+        time.sleep(20)
     return None
 
 def update_order_status(order):
@@ -212,7 +218,7 @@ def update_order_status(order):
         logger.error(f"Exchange error: {e}")
     except ccxt.RateLimitExceeded as e:
         logger.error(f"Rate limit exceeded: {e}")
-        time.sleep(60)
+        time.sleep(20)
     return order
 
 def fetch_balances():
@@ -227,7 +233,7 @@ def fetch_balances():
         logger.error(f"Exchange error: {e}")
     except ccxt.RateLimitExceeded as e:
         logger.error(f"Rate limit exceeded: {e}")
-        time.sleep(60)
+        time.sleep(20)
     return None, None
 
 def calculate_fees(symbol, side, amount, price):
@@ -241,15 +247,29 @@ def calculate_fees(symbol, side, amount, price):
 def check_open_orders(symbol):
     try:
         open_orders = exchange.fetch_open_orders(symbol)
-        return len(open_orders) > 0
+        return open_orders
     except ccxt.NetworkError as e:
         logger.error(f"Network error: {e}")
     except ccxt.ExchangeError as e:
         logger.error(f"Exchange error: {e}")
     except ccxt.RateLimitExceeded as e:
         logger.error(f"Rate limit exceeded: {e}")
-        time.sleep(60)
-    return False
+        time.sleep(20)
+    return []
+
+def adjust_sell_order(open_order, min_sell_price):
+    try:
+        exchange.cancel_order(open_order['id'], open_order['symbol'])
+        logger.info(f"Canceled open sell order: {open_order['id']}")
+        amount_to_sell = open_order['amount']
+        place_order(open_order['symbol'], 'sell', min_sell_price, amount_to_sell)
+    except ccxt.NetworkError as e:
+        logger.error(f"Network error: {e}")
+    except ccxt.ExchangeError as e:
+        logger.error(f"Exchange error: {e}")
+    except ccxt.RateLimitExceeded as e:
+        logger.error(f"Rate limit exceeded: {e}")
+        time.sleep(20)
 
 def live_trading(symbol):
     while True:
@@ -267,8 +287,14 @@ def live_trading(symbol):
             if time_since_last_call < TRADE_INTERVAL_SECONDS:
                 time.sleep(TRADE_INTERVAL_SECONDS - time_since_last_call)
             
-            if check_open_orders(symbol):
-                logger.info("There are unfilled open orders. Skipping this iteration.")
+            open_orders = check_open_orders(symbol)
+            if open_orders:
+                order_book = fetch_order_book(symbol)
+                order_book_analysis = analyze_order_book(order_book)
+                min_sell_price = order_book_analysis['min_exit_price']
+                for open_order in open_orders:
+                    if open_order['side'] == 'sell' and open_order['price'] < min_sell_price:
+                        adjust_sell_order(open_order, min_sell_price)
                 continue
             
             order_book = fetch_order_book(symbol)
@@ -299,12 +325,13 @@ def live_trading(symbol):
                 logger.info("Strong downtrend detected. Skipping this iteration.")
                 continue
 
-            logger.info(f"Market condition: {order_book_analysis['market_condition']}, Best entry price: {best_entry_price:.8f}")
+            logger.info(f"Market condition: {order_book_analysis['market_condition']}, Best entry price: {best_entry_price:.8f}, Overall Pressure: {order_book_analysis['overall_pressure']:.2f}")
 
             symbol_balance_usdt_equiv = symbol_balance * best_entry_price
 
             if (previous_market_condition in ['neutral', 'bearish'] and 
                 order_book_analysis['market_condition'] == 'bullish' and 
+                order_book_analysis['overall_pressure'] > 0 and 
                 symbol_balance_usdt_equiv < MAX_SYMBOL_BALANCE_USDT_EQUIV):
                 if active_trade is None and balance >= TRADE_AMOUNT:
                     amount_to_buy = TRADE_AMOUNT / best_entry_price
