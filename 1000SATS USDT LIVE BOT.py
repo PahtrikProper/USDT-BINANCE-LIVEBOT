@@ -9,11 +9,14 @@ load_dotenv()
 
 # Configurable Parameters
 SYMBOL = '1000SATS/USDT'
-ORDER_BOOK_DEPTH = 190
+ORDER_BOOK_DEPTH = 40
 TRADE_AMOUNT = 200
 TRADE_INTERVAL_SECONDS = 2
 MIN_PROFIT_PERCENTAGE = 0.0028  # Minimum profit percentage
 MAX_SYMBOL_BALANCE_USDT_EQUIV = 50
+RSI_PERIOD = 14
+RSI_OVERBOUGHT = 60
+RSI_OVERSOLD = 40
 
 # Order Book Analysis Parameters
 VOLUME_IMBALANCE_THRESHOLD = 1.5  # Adjusted for higher sensitivity
@@ -74,6 +77,48 @@ def fetch_recent_trades(symbol, limit=100):
         logger.error(f"Rate limit exceeded: {e}")
         time.sleep(20)
     return None
+
+def fetch_ohlcv(symbol, timeframe='1m', limit=RSI_PERIOD):
+    try:
+        return exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+    except ccxt.NetworkError as e:
+        logger.error(f"Network error: {e}")
+    except ccxt.ExchangeError as e:
+        logger.error(f"Exchange error: {e}")
+    except ccxt.RateLimitExceeded as e:
+        logger.error(f"Rate limit exceeded: {e}")
+        time.sleep(20)
+    return None
+
+def calculate_rsi(ohlcv):
+    closes = [candle[4] for candle in ohlcv]
+    if len(closes) < RSI_PERIOD:
+        return None
+
+    gains = [0]
+    losses = [0]
+
+    for i in range(1, len(closes)):
+        change = closes[i] - closes[i - 1]
+        if change > 0:
+            gains.append(change)
+            losses.append(0)
+        else:
+            gains.append(0)
+            losses.append(abs(change))
+
+    avg_gain = sum(gains[:RSI_PERIOD]) / RSI_PERIOD
+    avg_loss = sum(losses[:RSI_PERIOD]) / RSI_PERIOD
+
+    for i in range(RSI_PERIOD, len(closes)):
+        avg_gain = ((avg_gain * (RSI_PERIOD - 1)) + gains[i]) / RSI_PERIOD
+        avg_loss = ((avg_loss * (RSI_PERIOD - 1)) + losses[i]) / RSI_PERIOD
+
+    if avg_loss == 0:
+        return 100
+    rs = avg_gain / avg_loss
+    rsi = 100 - (100 / (1 + rs))
+    return rsi
 
 def analyze_order_book(order_book):
     asks = order_book['asks']
@@ -140,7 +185,7 @@ def analyze_recent_trades(recent_trades):
         'recent_prices': prices
     }
 
-def determine_best_entry_price(order_book_analysis, recent_trades_analysis):
+def determine_best_entry_price(order_book_analysis, recent_trades_analysis, rsi):
     significant_bid_price = order_book_analysis['best_bid_price']
     average_price = recent_trades_analysis['average_price']
     lowest_price = recent_trades_analysis['lowest_price']
@@ -148,8 +193,8 @@ def determine_best_entry_price(order_book_analysis, recent_trades_analysis):
     # Determine best entry price as the higher of significant bid price and average recent price
     best_entry_price = max(significant_bid_price, average_price)
     
-    # Ensure we're not buying at a peak
-    if best_entry_price > lowest_price * 1.01:  # Example threshold, adjust as needed
+    # Ensure we're not buying at a peak or during overbought conditions
+    if best_entry_price > lowest_price * 1.01 or rsi > RSI_OVERBOUGHT:  # Example threshold, adjust as needed
         best_entry_price = lowest_price
 
     return best_entry_price
@@ -272,124 +317,137 @@ def adjust_sell_order(open_order, min_sell_price):
         time.sleep(20)
 
 def live_trading(symbol):
+    balance, symbol_balance = fetch_balances()
+    if balance is None or symbol_balance is None:
+        logger.error("Failed to fetch initial balances. Exiting.")
+        return
+
+    ohlcv = fetch_ohlcv(symbol)
+    rsi = calculate_rsi(ohlcv)
+    if rsi is None:
+        logger.error("Failed to calculate RSI. Exiting.")
+        return
+    logger.info(f"Initial RSI: {rsi:.2f}")
+
+    active_trade = None
+    last_api_call_time = time.time()
+    previous_market_condition = 'neutral'
+    last_adjustment_time = 0  # Track last adjustment time for sell orders
+
     while True:
-        balance, symbol_balance = fetch_balances()
-        if balance is None or symbol_balance is None:
-            logger.error("Failed to fetch initial balances. Exiting.")
-            return
+        time_since_last_call = time.time() - last_api_call_time
+        if time_since_last_call < TRADE_INTERVAL_SECONDS:
+            time.sleep(TRADE_INTERVAL_SECONDS - time_since_last_call)
+        
+        open_orders = check_open_orders(symbol)
+        if open_orders:
+            order_book = fetch_order_book(symbol)
+            order_book_analysis = analyze_order_book(order_book)
+            min_sell_price = order_book_analysis['min_exit_price']
+            current_time = time.time()
 
-        active_trade = None
-        last_api_call_time = time.time()
-        previous_market_condition = 'neutral'
-
-        while True:
-            time_since_last_call = time.time() - last_api_call_time
-            if time_since_last_call < TRADE_INTERVAL_SECONDS:
-                time.sleep(TRADE_INTERVAL_SECONDS - time_since_last_call)
-            
-            open_orders = check_open_orders(symbol)
-            if open_orders:
-                order_book = fetch_order_book(symbol)
-                order_book_analysis = analyze_order_book(order_book)
-                min_sell_price = order_book_analysis['min_exit_price']
+            if current_time - last_adjustment_time >= 60:  # Check if 60 seconds have passed since the last adjustment
                 for open_order in open_orders:
                     if open_order['side'] == 'sell' and open_order['price'] < min_sell_price:
                         adjust_sell_order(open_order, min_sell_price)
-                continue
-            
-            order_book = fetch_order_book(symbol)
-            recent_trades = fetch_recent_trades(symbol)
-            last_api_call_time = time.time()
-            
-            if order_book is None or recent_trades is None:
-                logger.warning("Failed to fetch order book or recent trades. Skipping this iteration.")
-                continue
+                last_adjustment_time = current_time  # Update the last adjustment time
+            continue
+        
+        order_book = fetch_order_book(symbol)
+        recent_trades = fetch_recent_trades(symbol)
+        ohlcv = fetch_ohlcv(symbol)
+        rsi = calculate_rsi(ohlcv)
+        last_api_call_time = time.time()
+        
+        if order_book is None or recent_trades is None or rsi is None:
+            logger.warning("Failed to fetch order book, recent trades, or RSI. Skipping this iteration.")
+            continue
 
-            order_book_analysis = analyze_order_book(order_book)
-            recent_trades_analysis = analyze_recent_trades(recent_trades)
-            
-            if order_book_analysis is None or recent_trades_analysis is None:
-                logger.warning("Failed to analyze order book or recent trades. Skipping this iteration.")
-                continue
-            
-            best_entry_price = determine_best_entry_price(order_book_analysis, recent_trades_analysis)
+        order_book_analysis = analyze_order_book(order_book)
+        recent_trades_analysis = analyze_recent_trades(recent_trades)
+        
+        if order_book_analysis is None or recent_trades_analysis is None:
+            logger.warning("Failed to analyze order book or recent trades. Skipping this iteration.")
+            continue
+        
+        best_entry_price = determine_best_entry_price(order_book_analysis, recent_trades_analysis, rsi)
 
-            # Avoid buying if there are significant sell walls above the best entry price
-            significant_sell_walls = order_book_analysis['significant_sell_walls']
-            if any(wall[0] <= best_entry_price for wall in significant_sell_walls):
-                logger.info("Significant sell walls detected above the best entry price. Skipping this iteration.")
-                continue
+        # Avoid buying if there are significant sell walls above the best entry price
+        significant_sell_walls = order_book_analysis['significant_sell_walls']
+        if any(wall[0] <= best_entry_price for wall in significant_sell_walls):
+            logger.info("Significant sell walls detected above the best entry price. Skipping this iteration.")
+            continue
 
-            # Avoid buying during strong downtrends by analyzing recent price movements
-            if recent_trades_analysis['recent_prices'][-1] < min(recent_trades_analysis['recent_prices']):
-                logger.info("Strong downtrend detected. Skipping this iteration.")
-                continue
+        # Avoid buying during strong downtrends or overbought conditions
+        if recent_trades_analysis['recent_prices'][-1] < min(recent_trades_analysis['recent_prices']) or rsi > RSI_OVERBOUGHT:
+            logger.info("Strong downtrend or overbought condition detected. Skipping this iteration.")
+            continue
 
-            logger.info(f"Market condition: {order_book_analysis['market_condition']}, Best entry price: {best_entry_price:.8f}, Overall Pressure: {order_book_analysis['overall_pressure']:.2f}")
+        logger.info(f"Market condition: {order_book_analysis['market_condition']}, Best entry price: {best_entry_price:.8f}, RSI: {rsi:.2f}, Overall Pressure: {order_book_analysis['overall_pressure']:.2f}")
 
-            symbol_balance_usdt_equiv = symbol_balance * best_entry_price
+        symbol_balance_usdt_equiv = symbol_balance * best_entry_price
 
-            if (previous_market_condition in ['neutral', 'bearish'] and 
-                order_book_analysis['market_condition'] == 'bullish' and 
-                order_book_analysis['overall_pressure'] > 0 and 
-                symbol_balance_usdt_equiv < MAX_SYMBOL_BALANCE_USDT_EQUIV):
-                if active_trade is None and balance >= TRADE_AMOUNT:
-                    amount_to_buy = TRADE_AMOUNT / best_entry_price
-                    active_trade = place_order(symbol, 'buy', best_entry_price, amount_to_buy)
-                    if active_trade is not None:
-                        logger.info(f"Buy order placed at best entry price: {best_entry_price:.8f}")
-                        balance, symbol_balance = fetch_balances()  # Refresh balances
-                        logger.info(f"Updated balance after placing buy order: {balance:.2f} USDT, {SYMBOL.split('/')[0]} balance: {symbol_balance:.8f}")
-
-            if active_trade and active_trade['side'] == 'buy':
-                active_trade = update_order_status(active_trade)
-                if active_trade['status'] == 'closed':
-                    logger.info(f"Buy order filled at {active_trade['price']:.8f}")
+        if (previous_market_condition in ['neutral', 'bearish'] and 
+            order_book_analysis['market_condition'] == 'bullish' and 
+            order_book_analysis['overall_pressure'] > 0 and 
+            symbol_balance_usdt_equiv < MAX_SYMBOL_BALANCE_USDT_EQUIV):
+            if active_trade is None and balance >= TRADE_AMOUNT:
+                amount_to_buy = TRADE_AMOUNT / best_entry_price
+                active_trade = place_order(symbol, 'buy', best_entry_price, amount_to_buy)
+                if active_trade is not None:
+                    logger.info(f"Buy order placed at best entry price: {best_entry_price:.8f}")
                     balance, symbol_balance = fetch_balances()  # Refresh balances
-                    
-                    logger.info("Waiting 10 seconds before placing the sell order.")
-                    time.sleep(10)
-                    
-                    min_sell_price = order_book_analysis['min_exit_price']
+                    logger.info(f"Updated balance after placing buy order: {balance:.2f} USDT, {SYMBOL.split('/')[0]} balance: {symbol_balance:.8f}")
 
-                    # Fetch applicable fees
-                    sell_fee_rate = calculate_fees(symbol, 'sell', symbol_balance, min_sell_price)
+        if active_trade and active_trade['side'] == 'buy':
+            active_trade = update_order_status(active_trade)
+            if active_trade['status'] == 'closed':
+                logger.info(f"Buy order filled at {active_trade['price']:.8f}")
+                balance, symbol_balance = fetch_balances()  # Refresh balances
+                
+                logger.info("Waiting 10 seconds before placing the sell order.")
+                time.sleep(10)
+                
+                min_sell_price = order_book_analysis['min_exit_price']
 
-                    # Calculate the amount to sell considering the fees
-                    amount_to_sell = symbol_balance / (1 + sell_fee_rate)
+                # Fetch applicable fees
+                sell_fee_rate = calculate_fees(symbol, 'sell', symbol_balance, min_sell_price)
 
-                    # Calculate the potential profit percentage based on the order book analysis
-                    potential_sell_price = order_book_analysis['potential_sell_price']
-                    if potential_sell_price and potential_sell_price > min_sell_price:
-                        min_sell_price = potential_sell_price
+                # Calculate the amount to sell considering the fees
+                amount_to_sell = symbol_balance / (1 + sell_fee_rate)
 
-                    # Check if the equivalent value of the sell order is less than 50 USDT
-                    if amount_to_sell * min_sell_price < MAX_SYMBOL_BALANCE_USDT_EQUIV:
-                        logger.info(f"Equivalent value of the sell order is less than {MAX_SYMBOL_BALANCE_USDT_EQUIV} USDT. Skipping sell order.")
-                        active_trade = None
-                    else:
-                        while True:
-                            sell_order = place_order(symbol, 'sell', min_sell_price, amount_to_sell)
-                            if sell_order:
-                                logger.info(f"Sell order placed at price: {min_sell_price:.8f}")
-                                balance, symbol_balance = fetch_balances()  # Refresh balances
-                                logger.info(f"Updated {SYMBOL.split('/')[0]} balance after placing sell order: {symbol_balance:.8f}")
-                                break
-                            else:
-                                logger.error(f"Failed to place sell order. Retrying with adjusted amount.")
-                                amount_to_sell *= 0.99  # Reduce the amount slightly and retry
+                # Calculate the potential profit percentage based on the order book analysis
+                potential_sell_price = order_book_analysis['potential_sell_price']
+                if potential_sell_price and potential_sell_price > min_sell_price:
+                    min_sell_price = potential_sell_price
 
-            elif active_trade and active_trade['side'] == 'sell':
-                active_trade = update_order_status(active_trade)
-                if active_trade['status'] == 'closed':
-                    logger.info(f"Sell order filled at {active_trade['price']:.8f}")
-                    balance, symbol_balance = fetch_balances()  # Refresh balances
-                    logger.info(f"Updated balance after sell order filled: {balance:.2f} USDT, {SYMBOL.split('/')[0]} balance: {symbol_balance:.8f}")
+                # Check if the equivalent value of the sell order is less than 50 USDT
+                if amount_to_sell * min_sell_price < MAX_SYMBOL_BALANCE_USDT_EQUIV:
+                    logger.info(f"Equivalent value of the sell order is less than {MAX_SYMBOL_BALANCE_USDT_EQUIV} USDT. Skipping sell order.")
                     active_trade = None
+                else:
+                    while True:
+                        sell_order = place_order(symbol, 'sell', min_sell_price, amount_to_sell)
+                        if sell_order:
+                            logger.info(f"Sell order placed at price: {min_sell_price:.8f}")
+                            balance, symbol_balance = fetch_balances()  # Refresh balances
+                            logger.info(f"Updated {SYMBOL.split('/')[0]} balance after placing sell order: {symbol_balance:.8f}")
+                            break
+                        else:
+                            logger.error(f"Failed to place sell order. Retrying with adjusted amount.")
+                            amount_to_sell *= 0.99  # Reduce the amount slightly and retry
 
-            total_value = balance + symbol_balance * best_entry_price
-            logger.info(f"Current Balance: {balance:.2f} USDT, {SYMBOL.split('/')[0]} Balance: {symbol_balance:.8f}, Total Value: {total_value:.2f}")
-            previous_market_condition = order_book_analysis['market_condition']
+        elif active_trade and active_trade['side'] == 'sell':
+            active_trade = update_order_status(active_trade)
+            if active_trade['status'] == 'closed':
+                logger.info(f"Sell order filled at {active_trade['price']:.8f}")
+                balance, symbol_balance = fetch_balances()  # Refresh balances
+                logger.info(f"Updated balance after sell order filled: {balance:.2f} USDT, {SYMBOL.split('/')[0]} balance: {symbol_balance:.8f}")
+                active_trade = None
+
+        total_value = balance + symbol_balance * best_entry_price
+        logger.info(f"Current Balance: {balance:.2f} USDT, {SYMBOL.split('/')[0]} Balance: {symbol_balance:.8f}, Total Value: {total_value:.2f}")
+        previous_market_condition = order_book_analysis['market_condition']
 
 def main():
     live_trading(SYMBOL)
