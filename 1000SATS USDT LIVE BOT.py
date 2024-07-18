@@ -9,14 +9,14 @@ load_dotenv()
 
 # Configurable Parameters
 SYMBOL = '1000SATS/USDT'
-ORDER_BOOK_DEPTH = 25
+ORDER_BOOK_DEPTH = 21
 TRADE_AMOUNT = 200
 TRADE_INTERVAL_SECONDS = 2
 MIN_PROFIT_PERCENTAGE = 0.0028  # Minimum profit percentage
 MAX_SYMBOL_BALANCE_USDT_EQUIV = 50
 RSI_PERIOD = 14
-RSI_OVERBOUGHT = 60
-RSI_OVERSOLD = 40
+RSI_OVERBOUGHT = 70
+RSI_OVERSOLD = 30
 
 # Order Book Analysis Parameters
 VOLUME_IMBALANCE_THRESHOLD = 1.5  # Adjusted for higher sensitivity
@@ -266,6 +266,18 @@ def update_order_status(order):
         time.sleep(20)
     return order
 
+def cancel_order(order):
+    try:
+        exchange.cancel_order(order['id'], order['symbol'])
+        logger.info(f"Canceled order: {order['id']}")
+    except ccxt.NetworkError as e:
+        logger.error(f"Network error: {e}")
+    except ccxt.ExchangeError as e:
+        logger.error(f"Exchange error: {e}")
+    except ccxt.RateLimitExceeded as e:
+        logger.error(f"Rate limit exceeded: {e}")
+        time.sleep(20)
+
 def fetch_balances():
     try:
         balance_info = exchange.fetch_balance()
@@ -351,6 +363,11 @@ def live_trading(symbol):
                     if open_order['side'] == 'sell' and open_order['price'] < min_sell_price:
                         adjust_sell_order(open_order, min_sell_price)
                 last_adjustment_time = current_time  # Update the last adjustment time
+
+            for open_order in open_orders:
+                if open_order['side'] == 'buy' and open_order['price'] >= min_sell_price:
+                    cancel_order(open_order)
+
             continue
         
         order_book = fetch_order_book(symbol)
@@ -405,8 +422,8 @@ def live_trading(symbol):
                 logger.info(f"Buy order filled at {active_trade['price']:.8f}")
                 balance, symbol_balance = fetch_balances()  # Refresh balances
                 
-                logger.info("Waiting 10 seconds before placing the sell order.")
-                time.sleep(10)
+                logger.info("Waiting 4 seconds before placing the sell order.")
+                time.sleep(4)
                 
                 min_sell_price = order_book_analysis['min_exit_price']
 
