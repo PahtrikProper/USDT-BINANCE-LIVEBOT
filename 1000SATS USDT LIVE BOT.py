@@ -9,7 +9,7 @@ load_dotenv()
 
 # Configurable Parameters
 SYMBOL = '1000SATS/USDT'
-ORDER_BOOK_DEPTH = 40
+ORDER_BOOK_DEPTH = 25
 TRADE_AMOUNT = 200
 TRADE_INTERVAL_SECONDS = 2
 MIN_PROFIT_PERCENTAGE = 0.0028  # Minimum profit percentage
