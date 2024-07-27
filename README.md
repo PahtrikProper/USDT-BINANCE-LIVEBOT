@@ -1,5 +1,5 @@
 # Creating the detailed white paper content for the trading bot
-white_paper_content = """
+
 # Binance Automated Trading Bot White Paper
 
 ## Abstract
