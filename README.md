@@ -1,4 +1,3 @@
-# Creating the detailed white paper content for the trading bot
 
 # Binance Automated Trading Bot White Paper
 
